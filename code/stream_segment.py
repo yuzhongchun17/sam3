@@ -1,3 +1,78 @@
+"""
+stream_segment.py
+-----------------
+Live dual-stream viewer and SAM3 text-prompt segmenter for the DEX robot
+wrist camera. Subscribes to the colour + depth ZMQ streams published by
+pub_orbbec on the Jetson, shows them in an OpenCV window, and on demand
+runs SAM3 segmentation using a text prompt. The segmented RGBD frame is
+then published over ZMQ for anygrasp_sam3_stream.py to consume.
+
+Prerequisites
+-------------
+- pub_orbbec must be running on the Jetson (provides colour on port 10031
+  and depth on port 10033 by default).
+- conda environment 'sam3' activated (Python 3.12, PyTorch 2.7, CUDA 12.6).
+- SAM3 installed in editable mode (`pip install -e .` from the sam3 root).
+
+Configuration
+-------------
+Edit the three constants at the bottom of this file before running:
+
+    JETSON_IP  = "192.168.11.9"   # IP of the Jetson on your network
+    COLOR_PORT = "10031"          # ZMQ port for colour stream (pub_orbbec)
+    DEPTH_PORT = "10033"          # ZMQ port for depth stream  (pub_orbbec)
+
+Usage
+-----
+With display (requires a monitor or X forwarding):
+
+    conda activate sam3
+    python code/stream_segment.py
+
+Headless (SSH / no display — controlled via stdin):
+
+    conda activate sam3
+    python code/stream_segment.py --no-visualize
+
+Keyboard controls (display mode only)
+--------------------------------------
+  c   Switch viewer to colour mode
+  d   Switch viewer to depth mode (Jet colourmap)
+  s   Freeze the current frame and enter segmentation mode:
+        - SAM3 loads on first press (~30 s); subsequent presses are instant
+        - You will be prompted in the terminal:
+            [SAM3] Enter text prompt (blank to cancel):
+          Type a plain-English description of the object to segment,
+          e.g.  "cable"  or  "orange wire"  or  "green connector"
+        - If nothing is detected, you are re-prompted automatically
+          (no need to press 's' again)
+        - On success the segmented RGBD is published and a confirmation
+          is printed; press 's' again to segment a new frame
+  q   Quit
+
+Headless mode commands (stdin)
+-------------------------------
+  s   (or Enter) — freeze current frame and enter the text-prompt loop
+  q   — quit
+
+Output
+------
+Publishes segmented RGBD on:  tcp://127.0.0.1:5560
+
+Payload format (msgpack dict, consumed by anygrasp_sam3_stream.py):
+  color_img   : JPEG bytes  — BGR colour, pixels outside mask are black
+  depth_raw   : raw bytes   — uint16 depth, tobytes(); zero outside mask
+  depth_shape : [H, W]      — reshape depth_raw with this before use
+  prompt      : str         — the text prompt that produced this mask
+  timestamp   : float       — time.time()
+
+Example receiver (anygrasp side):
+  data  = msgpack.unpackb(socket.recv())
+  color = cv2.imdecode(np.frombuffer(data[b'color_img'], np.uint8), cv2.IMREAD_COLOR)
+  h, w  = data[b'depth_shape']
+  depth = np.frombuffer(data[b'depth_raw'], dtype=np.uint16).reshape(h, w)
+"""
+
 import os
 import argparse
 import cv2
