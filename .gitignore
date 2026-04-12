@@ -144,6 +144,12 @@ logs/
 runs/
 tensorboard/
 
+# Script outputs
+agent_output/
+
+# BPE assets (large binary)
+assets/
+
 # OS specific
 .DS_Store
 Thumbs.db

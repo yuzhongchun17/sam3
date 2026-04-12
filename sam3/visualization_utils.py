@@ -154,6 +154,24 @@ def plot_mask(mask, color="r", ax=None):
         ax = plt.gca()
     ax.imshow(mask_img)
 
+def plot_binary_mask(mask, color="r", ax=None):
+    # 1. Create a new figure ONLY if an axis wasn't provided
+    if ax is None:
+        plt.figure(figsize=(12, 8))
+        ax = plt.gca()
+    
+    # 2. Ensure mask is on CPU/Numpy for plotting
+    mask_np = mask.squeeze().cpu().numpy()
+    im_h, im_w = mask_np.shape
+    
+    # 3. Create the RGB image (Black background, colored mask)
+    # We use 3 channels (RGB) for a solid black background
+    mask_img = np.zeros((im_h, im_w, 3), dtype=np.float32)
+    mask_img[mask_np > 0.5] = to_rgb(color)
+    
+    ax.imshow(mask_img)
+    ax.axis('off') # Hide axes for a clean binary mask look
+
 
 def normalize_bbox(bbox_xywh, img_w, img_h):
     # Assumes bbox_xywh is in XYWH format
@@ -874,6 +892,13 @@ def plot_results(img, results):
             color=color,
             relative_coords=False,
         )
+def plot_binary_mask(results):
+    plt.figure(figsize=(12, 8))
+    nb_objects = len(results["scores"])
+    print(f"found {nb_objects} object(s)")
+    for i in range(nb_objects):
+        color = COLORS[i % len(COLORS)]
+        plot_mask(results["masks"][i].squeeze(0).cpu(), color=color)    
 
 
 def single_visualization(img, anns, title):
