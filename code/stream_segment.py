@@ -1,7 +1,10 @@
 """
 stream_segment.py
 -----------------
-Headless SAM3 text-prompt segmenter for the DEX robot wrist camera.
+SAM3 text-prompt segmenter for the DEX robot wrist camera. Control is
+headless (stdin commands), but a mask-overlay window is shown by default
+after each segmentation so you can see the result without needing to
+consume the published output — pass --no-viz to suppress it.
 Subscribes to the colour + depth ZMQ streams published by pub_orbbec on
 the Jetson, and on demand runs SAM3 segmentation using a text prompt.
 The segmented RGBD frame is then published over ZMQ for
@@ -37,7 +40,8 @@ Stdin commands
                 Type a plain-English description of the object to segment,
                 e.g.  "cable"  or  "orange wire"  or  "green connector".
                 Re-prompts automatically if nothing is detected.
-                On success the segmented RGBD is published.
+                On success the mask is shown blended over the original frame
+                (unless --no-viz) and the segmented RGBD is published.
   q             Quit
 
 Output
@@ -60,6 +64,7 @@ import msgpack
 import numpy as np
 import time
 import threading
+import multiprocessing as mp
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -67,13 +72,46 @@ logger = logging.getLogger(__name__)
 
 # torch / sam3 are imported lazily inside _load_sam3() to avoid an OpenMP
 # shared-library conflict with cv2 that causes a segfault at startup.
+#
+# cv2.imshow() itself is also unsafe to call from this process once SAM3 is
+# loaded: cv2's Qt5 GUI backend segfaults if initialized in a process that
+# has already loaded the SAM3 model (confirmed by direct repro -- happens
+# every time, immediately, regardless of OMP_NUM_THREADS/KMP_DUPLICATE_LIB_OK).
+# So the mask-overlay window runs in a separate spawned process that never
+# imports torch/sam3 -- see _viewer_process() and show_viz below.
+
+
+def _viewer_process(queue: mp.Queue, window_name: str):
+    """Runs in its own process (spawned, never imports torch/sam3). Receives
+    BGR frames over `queue` and displays them; a None sentinel exits.
+
+    Polls the queue with a short timeout instead of blocking, and calls
+    waitKey() every iteration regardless of whether a new frame arrived --
+    a window that blocks on I/O between frames stops pumping its event loop,
+    so the window manager never gets to repaint it (it can show stale/
+    uncomposited screen content instead of the last image shown)."""
+    import queue as _queue
+    import cv2 as _cv2
+    _cv2.namedWindow(window_name, _cv2.WINDOW_NORMAL)
+    while True:
+        try:
+            frame = queue.get(timeout=0.05)
+            if frame is None:
+                break
+            _cv2.imshow(window_name, frame)
+        except _queue.Empty:
+            pass
+        _cv2.waitKey(1)
+    _cv2.destroyAllWindows()
 
 
 class DualStreamViewer:
-    def __init__(self, color_ip_port: str, depth_ip_port: str, checkpoint: str = None):
+    def __init__(self, color_ip_port: str, depth_ip_port: str, checkpoint: str = None,
+                 show_viz: bool = True):
         self.color_ip_port = color_ip_port
         self.depth_ip_port = depth_ip_port
         self._checkpoint_path = checkpoint
+        self.show_viz = show_viz
 
         self.context = zmq.Context()
 
@@ -85,6 +123,16 @@ class DualStreamViewer:
         self._sam3_model = None
         self._sam3_processor = None
         self._PIL_Image = None
+
+        self._viz_queue = None
+        self._viz_process = None
+        if self.show_viz:
+            mp_ctx = mp.get_context('spawn')
+            self._viz_queue = mp_ctx.Queue()
+            self._viz_process = mp_ctx.Process(
+                target=_viewer_process, args=(self._viz_queue, MASK_WINDOW_NAME), daemon=True)
+            self._viz_process.start()
+            logger.info("Mask-overlay viewer process started (pid=%d)", self._viz_process.pid)
 
         self._seg_pub = self.context.socket(zmq.PUB)
         self._seg_pub.bind(f"tcp://127.0.0.1:{SEG_PUB_PORT}")
@@ -227,9 +275,32 @@ class DualStreamViewer:
                 seg_depth = np.zeros_like(depth_u16)
                 seg_depth[mask_depth] = depth_u16[mask_depth]
 
+            if self.show_viz:
+                self._show_mask_overlay(color_bgr, mask_bool, prompt, n_pixels)
+
             self._publish_segmented_rgbd(seg_rgb, seg_depth, prompt)
             print("[SAM3] Published. Press 's' + Enter to segment a new frame.")
             return
+
+    def _show_mask_overlay(self, color_bgr, mask_bool, prompt, n_pixels,
+                            mask_color=(0, 255, 0), alpha=0.5):
+        """Blend the mask over the original frame and draw its contour, so the
+        segmentation result is visible without needing the published output."""
+        colored_mask = np.zeros_like(color_bgr)
+        colored_mask[mask_bool] = mask_color
+        overlay = cv2.addWeighted(color_bgr, 1.0, colored_mask, alpha, 0)
+
+        mask_uint8 = (mask_bool.astype(np.uint8) * 255)
+        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, mask_color, 2)
+
+        label = f"'{prompt}'  ({n_pixels} px)"
+        cv2.putText(overlay, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Sent to the separate viewer process, not shown here -- see module
+        # docstring / _viewer_process for why cv2.imshow can't run in this process.
+        self._viz_queue.put(overlay)
 
     def _publish_segmented_rgbd(self, seg_rgb, seg_depth, prompt):
         ok, color_buf = cv2.imencode('.jpg', seg_rgb, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -265,6 +336,9 @@ class DualStreamViewer:
 
             if cmd == 'q':
                 logger.info("Exiting...")
+                if self.show_viz:
+                    self._viz_queue.put(None)
+                    self._viz_process.join(timeout=3)
                 break
             elif cmd == 's' or cmd == '':
                 with self.rgb_lock:
@@ -293,11 +367,15 @@ class DualStreamViewer:
 
 
 SEG_PUB_PORT = 5560  # local port — anygrasp subscribes to tcp://127.0.0.1:5560
+MASK_WINDOW_NAME = "SAM3 segmentation"  # overlay window shown after each segment, unless --no-viz
 
 if __name__ == "__main__":
-    JETSON_IP  = "192.168.11.9"
-    COLOR_PORT = "10031"
-    DEPTH_PORT = "10033"
+    # JETSON_IP  = "192.168.11.9"
+    # COLOR_PORT = "10031"
+    # DEPTH_PORT = "10033"
+    JETSON_IP  = "192.168.11.11"
+    COLOR_PORT = "10011"
+    DEPTH_PORT = "10013"
 
     parser = argparse.ArgumentParser(description="SAM3 streaming segmenter with ZMQ publisher")
     parser.add_argument("--checkpoint",
@@ -306,11 +384,14 @@ if __name__ == "__main__":
                             "snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt"
                         ),
                         help="Path to local SAM3 checkpoint .pt file.")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="Disable the default mask-overlay window shown after each segmentation.")
     args = parser.parse_args()
 
     viewer = DualStreamViewer(
         color_ip_port=f"{JETSON_IP}:{COLOR_PORT}",
         depth_ip_port=f"{JETSON_IP}:{DEPTH_PORT}",
         checkpoint=args.checkpoint,
+        show_viz=not args.no_viz,
     )
     viewer.run()
