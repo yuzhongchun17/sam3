@@ -1,48 +1,32 @@
 #!/usr/bin/env python
 """
-wire_grasp_pipeline_orbbec_untwist.py
---------------------------------------
-COAXIAL variant of wire_grasp_pipeline_orbbec.py: same capture -> segment ->
-grasp -> publish loop, but the grasp pose runs the gripper IN LINE with the
-wire (approaching from beyond its free tip) instead of straight down onto
-its middle, and each publish carries an extra "untwist_deg" field so
-grasp_executor_untwist.py can spin the wrist to undo a counted twist after
-closing the gripper. No bend step -- unlike SamRobotUntwisting.py (the
-Zivid+ABB script this is ported from), the dex rig grasps the wire coaxially
-as it lies.
+wire_grasp_pipeline_orbbec.py
+-------------------------------
+Live, in-process merge of capture_orbbec_images.py + segment_orbbec_wires.py +
+wire_grasp_pose_orbbec.py: on each trigger, capture a frame from the Orbbec
+"eye" camera, segment it with SAM3, compute a top-down grasp pose for the
+best wire, and publish it -- no round-trip through PNG/PCD files on disk.
 
-Ported from SamRobotUntwisting.py (Zivid+ABB, EGM joint control):
-  wire_tip_and_anchor        -> wire_tip_and_anchor_cam (same PCA-endpoint
-                                 idea, but the tip/anchor choice is judged by
-                                 distance to the ROBOT BASE origin instead of
-                                 |y| in robot frame -- see its docstring)
-  get_local_pca_direction    -> same function already in this file, now
-                                 signed OUTWARD like the ABB version (needed
-                                 for a coaxial approach; unsigned was fine
-                                 for a top-down one)
-  calculate_wire_orientation -> calculate_coaxial_orientation (same z = wire
-                                 axis idea; x seeded from world "up" in
-                                 camera-optical coordinates instead of a live
-                                 EE quaternion, since this process never
-                                 talks to the robot)
-  bundle_pcd_from_rotation   -> bundle_points_from_rotation (same idea: the
-                                 grasp is fitted to the whole twisted BUNDLE,
-                                 not a single coloured strand -- a strand
-                                 spirals around the bundle, so its own PCA
-                                 direction is that helix's tangent, tilted off
-                                 the bundle's true axis by roughly the twist
-                                 angle. GRASP_FROM_BUNDLE is not ported as a
-                                 toggle: per-colour segmentation only runs as
-                                 a fallback when rotation counting fails
-                                 outright, same as the ABB script's default)
-Rotation counting is WireRotationCounter (segmentation/count_wire_rotations.py
-in the barc_wire_sorting repo, a sibling of this workspace at the filesystem
-root) run on the same crop this file already uses for segmentation -- no
-second bbox file, unlike the ABB script's separate ROTATION_BBOX_FILE. Its own
-wire mask (WIRE_PROMPTS: "colorful wire", "twisted wire", ...) is also this
-file's grasp geometry -- see bundle_points_from_rotation -- so colour prompts
-("red wire", ...) are only ever used for the per-strand rotation count, never
-to pick grasp points.
+The three source scripts stay useful on their own for offline
+capture/tuning/debugging; this script is the "just run the whole thing"
+path once the workspace bbox and wire colours are already dialed in.
+
+Pipeline per trigger:
+  1. capture_orbbec_images.OrbbecCapture.grab_rgb() -- latest colour+depth,
+     cropped to the workspace bbox (same auto/manual/saved bbox workflow).
+  2. SAM3 text-prompt segmentation per --colors (default: the whole bundle --
+     tries "twisted wire" plus a few synonym phrasings in turn until one
+     detects something, since a real twist doesn't always match the first
+     wording; pass --colors to target individual colours instead),
+     masked by valid depth, back-projected to camera-frame XYZ (mm) --
+     segment_orbbec_wires.py's segment_one(), kept in memory instead of
+     writing _mask_*.png/_pcd_*.pcd.
+  3. Whichever segmented wire has the most 3-D points -- or --wire, forced --
+     goes through wire_grasp_pose_orbbec.py's find_grasp_pose() (local PCA
+     direction at the wire's centroid + top_down_frame()).
+  4. Publish the grasp already in ROBOT BASE frame on --zmq_pub_addr (same
+     port/schema grasp_executor.py listens on, "frame": "base"), plus an
+     optional persistent ROS2 static TF for RViz sanity-checking.
 
 cv2.imshow can't run in this process once SAM3 is loaded (confirmed segfault,
 see stream_segment.py's module docstring), so interactive bbox picking ('s')
@@ -54,7 +38,7 @@ Prerequisite: pub_orbbec must be running on the Jetson for --camera_name's
 camera (richtech-dex-open-cli run-plugin pub_orbbec -i <index>).
 
 Stdin commands (all + Enter):
-  <blank>   Capture -> segment -> count rotations -> grasp -> publish, once.
+  <blank>   Capture -> segment -> grasp -> publish, once.
   s         Hand-pick the workspace crop box (drag on a live frame).
   a         Auto-detect the crop box (table plane + hue-variance twist).
   m         Reload the crop box saved at --bbox_file.
@@ -62,9 +46,9 @@ Stdin commands (all + Enter):
 
 Run:
     conda activate sam3
-    python wire_grasp_pipeline_orbbec_untwist.py
-    python wire_grasp_pipeline_orbbec_untwist.py --auto_bbox --wire green_wire
-    python wire_grasp_pipeline_orbbec_untwist.py --colors "green wire,black wire" --no_publish_tf
+    python wire_grasp_pipeline_orbbec.py
+    python wire_grasp_pipeline_orbbec.py --auto_bbox --wire yellow_wire
+    python wire_grasp_pipeline_orbbec.py --colors "yellow wire,red wire" --no_publish_tf
 """
 
 import os
@@ -95,20 +79,28 @@ import zmq
 
 import bbox_utils
 
-#WireRotationCounter lives in the barc_wire_sorting repo (a sibling directory of this
-#workspace's root, not a dex-workspace submodule) -- reach into it directly rather than
-#vendoring a copy, the same trick SamRobotUntwisting.py uses for the same module.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                '..', '..', 'barc_wire_sorting', 'segmentation'))
-from count_wire_rotations import WireRotationCounter
-
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
+# Known individual wire colours -- only used to look up a viz colour when
+# --colors names one of these explicitly (see parse_colors_arg()). The default
+# capture-time target is the whole twisted bundle, not any single colour.
+WIRE_COLOR_PALETTE = [
+    ('yellow_wire', 'yellow wire', [255, 215, 0]),
+    ('red_wire',    'red wire',    [220, 50, 50]),
+    ('blue_wire',   'blue wire',   [30, 144, 255]),
+    ('white_wire',  'white wire',  [230, 230, 230]),
+]
+
 WIRES_DEFAULT = [
-    ('black_wire', 'black wire', [30, 30, 30]),
-    ('green_wire', 'green wire', [40, 180, 60]),
-    ('white_wire', 'white wire', [230, 230, 230]),
+    ('twisted_wire', [
+        'twisted wire',
+        'twisted wires',
+        'bundle of wires',
+        'wire bundle',
+        'coiled wire',
+        'cable bundle',
+    ], [200, 200, 200]),
 ]
 
 DEFAULT_INTRINSICS_JSON = os.path.expanduser(
@@ -123,28 +115,21 @@ DEFAULT_CAMERA_FRAME = 'eye_camera_optical_frame'
 DEFAULT_GRASP_FRAME = 'wire_grasp'
 ROS_SETUP_CMD = 'source /opt/ros/jazzy/setup.bash'
 
-# Same port grasp_executor_untwist.py listens on by default -- this is a drop-in
+# Same port grasp_executor.py listens on by default -- this is a drop-in
 # alternative source to anygrasp_sam3_stream.py, not something that runs
 # alongside it on the same port.
 DEFAULT_ZMQ_PUB_ADDR = 'tcp://*:5561'
 ZMQ_SLOW_JOINER_DELAY_S = 0.5  # PUB/SUB: give a subscriber time to connect before the first send()
 
-# grasp_executor_untwist.py's --ready_signal_addr default is 'tcp://*:5564' (it binds); this
-# is the Jetson's IP, the host that script runs on (same machine as --jetson_ip's camera stream).
+# grasp_executor.py's --ready_signal_addr default is 'tcp://*:5564' (it binds); this is the
+# Jetson's IP, the host that script runs on (same machine as --jetson_ip's camera stream).
 DEFAULT_READY_SIGNAL_ADDR = 'tcp://192.168.11.11:5564'
 
-LOCAL_PCA_RADIUS_MM = 30.0
+LOCAL_PCA_RADIUS_MM = 10.0
 WIRE_WIDTH_MM = 3.0
 SIDE_MARGIN_MM = 4.0
 
-# Depth-gap + DBSCAN cloud cleanup, ported from SAMSegmentationClass._filter_indices
-# (barc_wire_sorting/sam_wire_grasp_loop) -- see filter_wire_points() below. None disables
-# the respective stage, same as SAMSegmenter's own constructor defaults.
-DEPTH_GAP_TOL_MM = 50.0
-DBSCAN_EPS_MM = 3.0
-DBSCAN_MIN_PTS = 10
-
-MASK_WINDOW_NAME = "wire_grasp_pipeline_orbbec_untwist: mask overlay"
+MASK_WINDOW_NAME = "wire_grasp_pipeline_orbbec: mask overlay"
 
 
 def parse_args():
@@ -160,9 +145,7 @@ def parse_args():
                         "pose, before giving up on it -- SAM3 detection is flaky frame-to-frame "
                         "(default: %(default)s, i.e. 3 attempts total)")
 
-    # Workspace bbox -- same workflow as capture_orbbec_images.py / stream_segment.py. Also the
-    # crop the rotation counter runs on, so grasp segmentation and twist counting always look
-    # at the identical region.
+    # Workspace bbox -- same workflow as capture_orbbec_images.py / stream_segment.py.
     p.add_argument("--bbox", type=int, nargs=4, metavar=("X", "Y", "W", "H"), default=None,
                    help="Crop box applied to every captured frame")
     p.add_argument("--bbox_file", default=None,
@@ -185,28 +168,18 @@ def parse_args():
     p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT, help="Path to local SAM3 checkpoint .pt file")
     p.add_argument("--confidence", type=float, default=0.35)
     p.add_argument("--min_confidence", type=float, default=0.15,
-                   help="Fallback confidence retried once per wire colour (cheaply -- reuses the "
+                   help="Fallback confidence retried once per prompt (cheaply -- reuses the "
                         "cached image encoding) when nothing clears --confidence, so a wire "
-                        "changing lighting pushed just under the normal threshold still gets "
-                        "found (default: %(default)s)")
-    p.add_argument("--no_light_norm", action="store_true",
-                   help="Skip white-balance/CLAHE normalization of SAM3's input frame (on by "
-                        "default -- corrects colour-temperature/exposure drift between lighting "
-                        "setups so colour prompts like 'red wire' stay reliable)")
+                        "just under the normal threshold (lighting/angle) still gets found "
+                        "(default: %(default)s)")
     p.add_argument("--colors", default=None,
                    help='Comma-separated SAM3 prompts to segment each capture with, e.g. '
-                        '"yellow wire,red wire" (default: the 4 standard wire colours)')
+                        '"yellow wire,red wire" (default: "twisted wire", the whole bundle '
+                        'rather than any single colour)')
     p.add_argument("--wire", default=None,
                    help="Force the grasp target to this wire name (matches --colors, spaces -> underscores), "
                         "skipping the most-points comparison across colours")
     p.add_argument("--no_viz", action="store_true", help="Skip the mask-overlay window shown after each segmentation")
-    p.add_argument("--debug_pcd", action="store_true",
-                   help="Open a blocking Open3D window of the segmented point cloud (grey), the "
-                        "tip/anchor endpoints (red/blue) and the local-PCA neighbourhood used for "
-                        "wire_dir (green) before/whether or not a grasp pose is found -- for "
-                        "spotting a stray outlier point (mixed wire/background pixel, depth noise) "
-                        "that a min/max PCA projection can pick as the tip. Close the window to "
-                        "continue to the next capture.")
 
     # Camera geometry.
     p.add_argument("--intrinsics_json", default=DEFAULT_INTRINSICS_JSON,
@@ -224,9 +197,9 @@ def parse_args():
     p.add_argument("--no_publish_tf", action="store_true", help="Skip publishing the ROS2 static TF")
 
     # Auto-trigger: replaces the blank-Enter keypress with a ZMQ signal from
-    # grasp_executor_untwist.py (published once its right arm finishes parking).
+    # grasp_executor.py (published once both its arms finish homing).
     p.add_argument("--ready_signal_addr", default=DEFAULT_READY_SIGNAL_ADDR,
-                   help="ZMQ address to connect to for the ready-signal from grasp_executor_untwist.py "
+                   help="ZMQ address to connect to for the ready-signal from grasp_executor.py "
                         "-- must point at the host running that script, not this one (default: %(default)s)")
     p.add_argument("--interactive", action="store_true",
                    help="Fall back to the manual blank-Enter/s/a/m/q stdin loop instead of waiting "
@@ -382,104 +355,55 @@ def load_sam3(checkpoint, confidence):
 def parse_colors_arg(colors_arg):
     if not colors_arg:
         return WIRES_DEFAULT
-    palette = {name: color for name, _, color in WIRES_DEFAULT}
+    palette = {name: color for name, _, color in WIRE_COLOR_PALETTE}
     wires = []
     for prompt in (c.strip() for c in colors_arg.split(',') if c.strip()):
         name = prompt.replace(' ', '_')
-        wires.append((name, prompt, palette.get(name, [200, 200, 200])))
+        wires.append((name, [prompt], palette.get(name, [200, 200, 200])))
     return wires
 
 
-def _find_depth_gap(z_vals, n_bins=50, min_gap_bins=5):
-    """Z histogram -> threshold at the furthest significant gap (prevents bleed-over onto
-    background behind the wire). None if no clear gap is found. Ported verbatim from
-    SAMSegmentationClass._find_depth_gap (barc_wire_sorting/sam_wire_grasp_loop)."""
-    hist, edges = np.histogram(z_vals, bins=n_bins)
-    occupied = np.where(hist > 0)[0]
-    if len(occupied) < 2:
-        return None
-    peak = np.argmax(hist)
-    spacings = np.diff(occupied)
-    valid_gaps = np.where((spacings > min_gap_bins) & (occupied[:-1] >= peak))[0]
-    if len(valid_gaps) == 0:
-        return None
-    return edges[occupied[valid_gaps[-1]] + 1]
+def segment_frame(processor, rgb, xyz, valid, wires, min_confidence=None):
+    """Runs SAM3 on `rgb`, in memory -- no PNG/PCD written to disk (that's
+    what segment_orbbec_wires.py is for, offline).
 
+    Each wire in `wires` is (name, prompts, color) where `prompts` is a list
+    of text-prompt phrasings tried in order, stopping at the first one SAM3
+    detects anything for -- a twisted bundle doesn't always match "twisted
+    wire" (lighting/angle can hide the twist), so WIRES_DEFAULT carries a few
+    synonym phrasings as free retries against the same cached image encoding.
 
-def filter_wire_points(points_mm, colors, label='wire',
-                        depth_tol_mm=DEPTH_GAP_TOL_MM, dbscan_eps=DBSCAN_EPS_MM,
-                        dbscan_min_pts=DBSCAN_MIN_PTS):
-    """Depth-gap filter + DBSCAN: turns a raw back-projected SAM mask into one clean wire
-    cloud, same two stages SamRobotUntwisting.py runs via SAMSegmenter.filter_wire_points
-    (SAMSegmentationClass._filter_indices) before trusting a cloud for grasp geometry. Without
-    this, a stray mixed wire/background edge pixel or depth-noise spike can hijack
-    wire_tip_and_anchor_cam's min/max-along-the-PCA-axis tip pick -- see
-    show_debug_pointcloud's docstring.
-      depth filter: histogram gap between wire and background; falls back to a fixed
-                    tolerance past the near percentile if no clear gap exists. None disables.
-      DBSCAN:       keep the nearest cluster (smallest mean Z = closest to camera = the wire),
-                    ignoring clusters under 40% of the largest cluster's size. None disables."""
-    idx = np.arange(len(points_mm))
-    if len(idx) == 0:
-        return points_mm, colors
+    If `min_confidence` is set (and lower than the processor's own threshold),
+    each prompt that comes up empty at the normal confidence is retried once
+    more at `min_confidence` before moving to the next phrasing -- same cheap
+    fallback (reuses the cached image encoding) as
+    wire_grasp_pipeline_orbbec_untwist.py's segment_frame()/stream_segment.py.
 
-    if depth_tol_mm is not None:
-        z = points_mm[:, 2]
-        z_thresh = _find_depth_gap(z)
-        if z_thresh is None:
-            z_thresh = np.percentile(z, 5) + depth_tol_mm
-        idx = idx[z[idx] <= z_thresh]
-
-    if dbscan_eps is not None and len(idx) > dbscan_min_pts:
-        import open3d as o3d
-        pts = points_mm[idx]
-        tmp = o3d.geometry.PointCloud()
-        tmp.points = o3d.utility.Vector3dVector(pts)
-        labels = np.array(tmp.cluster_dbscan(eps=dbscan_eps, min_points=dbscan_min_pts))
-        if labels.max() >= 0:
-            unique, counts = np.unique(labels[labels >= 0], return_counts=True)
-            min_size = max(dbscan_min_pts, int(counts.max() * 0.4))
-            valid = unique[counts >= min_size]
-            mean_z = np.array([pts[labels == c, 2].mean() for c in valid])
-            largest = valid[np.argmin(mean_z)]
-            idx = idx[labels == largest]
-
-    if len(idx) < len(points_mm):
-        logger.info(f'  {label:15s} cloud filter: {len(points_mm)} -> {len(idx)} pts')
-    return points_mm[idx], colors[idx]
-
-
-def segment_frame(processor, rgb, xyz, valid, wires, min_confidence=None, light_norm=True):
-    """Runs SAM3 once per wire prompt on `rgb`, in memory -- no PNG/PCD
-    written to disk (that's what segment_orbbec_wires.py is for, offline).
-    Returns {wire_name: (mask_bool HxW, points_mm Nx3, colors_0to1 Nx3)}.
-
-    SAM3 itself only ever sees `sam_rgb` (white-balanced/CLAHE'd -- see
-    bbox_utils.normalize_lighting) when light_norm is set; `rgb` stays
-    untouched for the point-cloud colours pulled out below, so a lighting fix
-    aimed at SAM3's colour-word prompts can't skew the actual grasp data."""
+    Returns {wire_name: (mask_bool HxW, points_mm Nx3, colors_0to1 Nx3, prompt_used)}."""
     from PIL import Image
-    sam_rgb = bbox_utils.normalize_lighting(rgb, color_order='rgb') if light_norm else rgb
-    state = processor.set_image(Image.fromarray(sam_rgb))
+    state = processor.set_image(Image.fromarray(rgb))
     base_confidence = processor.confidence_threshold
 
     results = {}
-    for name, prompt, _color in wires:
-        processor.reset_all_prompts(state)
-        state = processor.set_text_prompt(state=state, prompt=prompt)
-        raw_masks = state.get('masks')
-        if (raw_masks is None or len(raw_masks) == 0) and min_confidence is not None \
-                and min_confidence < base_confidence:
-            # Cheap retry against the cached image encoding -- see stream_segment.py's
-            # identical fallback for why (changing lighting can push a real wire just
-            # under the configured threshold).
-            logger.info(f'  {name:15s} not detected at confidence={base_confidence:.2f}, '
-                        f'retrying at {min_confidence:.2f}')
-            state = processor.set_confidence_threshold(min_confidence, state)
-            raw_masks = state.get('masks')
-            processor.set_confidence_threshold(base_confidence)  # restore for the next prompt
-        if raw_masks is None or len(raw_masks) == 0:
-            logger.info(f'  {name:15s} not detected')
+    for name, prompts, _color in wires:
+        raw_masks = matched_prompt = None
+        for prompt in prompts:
+            processor.reset_all_prompts(state)
+            state = processor.set_text_prompt(state=state, prompt=prompt)
+            candidate = state.get('masks')
+            if (candidate is None or len(candidate) == 0) and min_confidence is not None \
+                    and min_confidence < base_confidence:
+                logger.info(f"  {name:15s} not detected at confidence={base_confidence:.2f} for "
+                            f"'{prompt}', retrying at {min_confidence:.2f}")
+                state = processor.set_confidence_threshold(min_confidence, state)
+                candidate = state.get('masks')
+                processor.set_confidence_threshold(base_confidence)  # restore for the next prompt
+            if candidate is not None and len(candidate) > 0:
+                raw_masks, matched_prompt = candidate, prompt
+                break
+        if raw_masks is None:
+            tried = ', '.join(f"'{p}'" for p in prompts)
+            logger.info(f'  {name:15s} not detected (tried: {tried})')
             continue
         masks_np = raw_masks.detach().cpu().numpy()
         if masks_np.ndim == 4:
@@ -494,36 +418,11 @@ def segment_frame(processor, rgb, xyz, valid, wires, min_confidence=None, light_
 
         points_mm = xyz[sel] * 1000.0  # metres -> mm, matching wire_grasp_pose_orbbec.py's convention
         colors = rgb[sel].astype(np.float64) / 255.0
-        logger.info(f'  {name:15s} {n_pts:7,} pts')
-        points_mm, colors = filter_wire_points(points_mm, colors, label=name)
-        results[name] = (mask, points_mm, colors)
+        suffix = f" (prompt: '{matched_prompt}')" if matched_prompt != prompts[0] else ""
+        logger.info(f'  {name:15s} {n_pts:7,} pts{suffix}')
+        results[name] = (mask, points_mm, colors, matched_prompt)
 
     return results
-
-
-def bundle_points_from_rotation(rotation_out, rgb, xyz, valid):
-    """Back-projects rotation_counter.analyze()'s own bundle mask (WIRE_PROMPTS: 'colorful
-    wire', 'twisted wire', ... -- see count_wire_rotations.py) to camera-frame 3-D points -- no
-    extra SAM3 call, analyze() already built this mask while counting rotations. This is the
-    grasp geometry for the whole twisted bundle, ported from SamRobotUntwisting.py's
-    bundle_pcd_from_rotation() (see module docstring for why the bundle, not a single strand).
-    Returns (mask_bool HxW, points_mm Nx3, colors_0to1 Nx3), or None if it back-projects to 0
-    valid points."""
-    mask = rotation_out['wire_mask']
-    H, W = rgb.shape[:2]
-    if mask.shape != (H, W):
-        # analyze() downscales internally past its max_side default -- paste the mask back onto
-        # this frame's own pixel grid (NEAREST: it's a label mask, interpolating would invent
-        # edge pixels that back-project to the wrong depth) before it can index xyz/valid.
-        mask = cv2.resize(mask.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
-
-    sel = mask & valid
-    if not sel.any():
-        return None
-    points_mm = xyz[sel] * 1000.0  # metres -> mm, matching segment_frame()'s convention
-    colors = rgb[sel].astype(np.float64) / 255.0
-    points_mm, colors = filter_wire_points(points_mm, colors, label='bundle')
-    return mask, points_mm, colors
 
 
 def show_mask_overlay(viz_queue, color_bgr, mask_bool, prompt, n_pixels,
@@ -538,18 +437,10 @@ def show_mask_overlay(viz_queue, color_bgr, mask_bool, prompt, n_pixels,
     viz_queue.put(('overlay', overlay))
 
 
-# ── Grasp geometry: COAXIAL, ported from SamRobotUntwisting.py (see module docstring). All of
-# it stays in CAMERA-OPTICAL frame (mm), same as the top-down version it replaces -- only the
-# tip/anchor judgement below needs a peek at robot-base distance, and it converts just the two
-# candidate points to do that rather than moving the whole pipeline into base frame. ──
+# ── Grasp geometry, ported unchanged (frame-agnostic pure functions) from
+# wire_grasp_pose_orbbec.py -- see that file's docstrings for full derivations. ──
 
 def get_local_pca_direction(centre_point, points_mm, radius_mm=LOCAL_PCA_RADIUS_MM):
-    """Local wire direction at centre_point, SIGNED OUTWARD -- away from the wire body and
-    toward centre_point -- so a coaxial approach (z = -direction, see
-    calculate_coaxial_orientation) always comes from beyond the free end, never from beyond the
-    anchor. The top-down grasp this replaces didn't care about this sign (jaws land the same
-    either way); a coaxial one very much does, so the anchoring is added here rather than left
-    to whichever way SVD happens to return vt[0]."""
     distances = np.linalg.norm(points_mm - centre_point, axis=1)
     local_points = points_mm[distances <= radius_mm]
     if len(local_points) < 3:
@@ -558,159 +449,37 @@ def get_local_pca_direction(centre_point, points_mm, radius_mm=LOCAL_PCA_RADIUS_
         return None, None
     centroid = local_points.mean(axis=0)
     _, _, vt = np.linalg.svd(local_points - centroid)
-    direction = vt[0]
-
-    overall_centroid = points_mm.mean(axis=0)
-    outward_ref = centre_point - overall_centroid
-    if np.dot(direction, outward_ref) < 0:
-        direction = -direction
-    return local_points, direction
+    return local_points, vt[0]
 
 
-def wire_tip_and_anchor_cam(points_mm, T_optical_to_base):
-    """Both ends of the wire along its principal axis, in CAMERA-OPTICAL frame (mm): the free
-    TIP a coaxial grasp approaches from beyond, and the ANCHOR it pivots about (unused today,
-    kept because it falls out of the same fit for free -- see SamRobotUntwisting.py).
-
-    SamRobotUntwisting.py picked the tip by comparing |y| in ROBOT frame, which relied on
-    knowing which way the fixture sits relative to the ABB's base. That axis convention doesn't
-    carry over to the dex rig, so this instead picks whichever endpoint sits FARTHER FROM THE
-    ROBOT BASE ORIGIN -- converting just the two candidate endpoints through T_optical_to_base,
-    not the whole cloud, so the rest of this file's geometry stays in camera-optical frame.
-    Confirmed against the dex fixture: the anchor (fixture clamp) sits closer to the base, the
-    free tip swings out farther."""
-    if points_mm.shape[0] < 20:
-        return None, None
-    centroid = points_mm.mean(axis=0)
-    _, _, vt = np.linalg.svd(points_mm - centroid)
-    direction = vt[0]
-    t = (points_mm - centroid) @ direction
-    # Actual data points at the extremes, NOT their projection onto the fitted line
-    # (centroid + t.min()*direction): the bundle mask covers a whole twisted bundle, which can
-    # bow/curve well past LOCAL_PCA_RADIUS_MM off a single straight-line fit, especially near a
-    # loose free tip -- get_local_pca_direction's neighbourhood search would then centre on empty
-    # space next to the real cloud and find 0 points. Indexing the real point guarantees at least
-    # itself (and whatever real neighbours are actually there) falls inside that search.
-    endpoint_1 = points_mm[int(np.argmin(t))]
-    endpoint_2 = points_mm[int(np.argmax(t))]
-
-    def dist_to_base_origin(p_mm):
-        p_h = np.append(p_mm / 1000.0, 1.0)
-        p_base = T_optical_to_base @ p_h
-        return float(np.linalg.norm(p_base[:3]))
-
-    if dist_to_base_origin(endpoint_1) > dist_to_base_origin(endpoint_2):
-        return endpoint_1, endpoint_2
-    return endpoint_2, endpoint_1
-
-
-def calculate_coaxial_orientation(wire_dir, up):
-    """COAXIAL grasp frame: tool z runs ALONG the wire, travelling from beyond the tip INTO it
-    (ported from SamRobotUntwisting.py's calculate_wire_orientation). wire_dir is already
-    signed outward by get_local_pca_direction, so the approach/insertion direction is its
-    negation.
-    x has no live EE orientation to seed it from roll-to-roll -- this process never talks to
-    the robot, see the module docstring -- so it is built from `up` (world "up" expressed in
-    camera-optical coordinates, i.e. -down_cam) instead. Any perpendicular is a valid x here:
-    the grasp is rotationally symmetric about z."""
-    pca_unit = wire_dir / np.linalg.norm(wire_dir)
-    z_axis = -pca_unit
-
-    x_axis = up - np.dot(up, z_axis) * z_axis
+def top_down_frame(centre, wire_dir, down):
+    down = down / np.linalg.norm(down)
+    z_axis = down
+    x_axis = wire_dir - np.dot(wire_dir, z_axis) * z_axis
     if np.linalg.norm(x_axis) < 1e-6:
-        #Wire is parallel to `up`: it has no component perpendicular to it, so fall back to
-        #whichever camera axis isn't parallel to z either.
         x_axis = np.cross([1.0, 0.0, 0.0], z_axis)
         if np.linalg.norm(x_axis) < 1e-6:
             x_axis = np.cross([0.0, 1.0, 0.0], z_axis)
-    x_axis /= np.linalg.norm(x_axis)
-    y_axis = np.cross(z_axis, x_axis)   #right-handed: z cross x = y
-    return np.stack([x_axis, y_axis, z_axis], axis=1)
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+
+    T = np.eye(4)
+    T[:3, :3] = np.stack([x_axis, y_axis, z_axis], axis=1)
+    T[:3, 3] = centre
+    return T
 
 
-def show_debug_pointcloud(points_mm, colors=None, tip=None, anchor=None, local_pts=None,
-                           T_grasp=None, title="segmented point cloud"):
-    """Blocking Open3D window of the cloud find_coaxial_grasp_pose() is about to trust, so a
-    stray outlier (a mixed wire/background edge pixel, a depth-noise spike) can be SEEN before
-    blaming "not enough points near the tip" on sensor dropout -- wire_tip_and_anchor_cam's
-    min/max-along-the-PCA-axis pick is exactly the kind of thing one bad far-flung point can hijack.
-    Runs in THIS process, unlike the mask-overlay window: the segfault documented at the top of
-    this file is specific to cv2's Qt GUI backend after SAM3 loads, not GL/GLFW in general --
-    SamRobotUntwisting.py opens Open3D windows the same way, in the same process as its own SAM3
-    model.
-      grey    = every segmented point
-      red     = tip (wire_tip_and_anchor_cam's pick)
-      blue    = anchor
-      green   = the local-PCA neighbourhood get_local_pca_direction found near the tip (empty/
-                too small green cluster around an isolated red point is the outlier signature)
-      triad   = the fitted grasp frame, if one was found
-    Close the window to continue to the next capture."""
-    import open3d as o3d
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_mm)
-    pcd.colors = (o3d.utility.Vector3dVector(colors) if colors is not None
-                  else o3d.utility.Vector3dVector(np.full((len(points_mm), 3), 0.5)))
-    geoms = [pcd, o3d.geometry.TriangleMesh.create_coordinate_frame(size=10.0)]  # camera-optical origin
-
-    def marker(xyz, color, radius):
-        s = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
-        s.translate(xyz)
-        s.paint_uniform_color(color)
-        s.compute_vertex_normals()
-        return s
-
-    if tip is not None:
-        geoms.append(marker(tip, [1.0, 0.0, 0.0], radius=3.0))
-        print(f"  [debug pcd] tip (red):     {np.round(tip, 1).tolist()}")
-    if anchor is not None:
-        geoms.append(marker(anchor, [0.0, 0.0, 1.0], radius=3.0))
-        print(f"  [debug pcd] anchor (blue): {np.round(anchor, 1).tolist()}")
-    if local_pts is not None and len(local_pts):
-        local_pcd = o3d.geometry.PointCloud()
-        local_pcd.points = o3d.utility.Vector3dVector(local_pts)
-        local_pcd.paint_uniform_color([0.0, 1.0, 0.0])
-        geoms.append(local_pcd)
-        print(f"  [debug pcd] {len(local_pts)} local pts (green) near the tip")
-    if T_grasp is not None:
-        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=15.0)
-        frame.transform(T_grasp)
-        geoms.append(frame)
-
-    print(f"  [debug pcd] {title} -- {len(points_mm):,} pts total, close the window to continue")
-    o3d.visualization.draw_geometries(geoms, window_name=title)
-
-
-def find_coaxial_grasp_pose(points_mm, up_cam, T_optical_to_base, radius_mm=LOCAL_PCA_RADIUS_MM,
-                             debug=False, debug_colors=None, debug_title="segmented point cloud"):
-    """tip/anchor -> local PCA direction at the tip -> coaxial frame, all in camera-optical
-    frame (mm). Returns (T_grasp_cam_mm, local_pts, tip, anchor) or None.
-
-    debug=True opens show_debug_pointcloud() on every path out of this function, success or
-    failure alike -- a failure still has SOMETHING worth looking at (the raw cloud, or the raw
-    cloud plus the tip that couldn't find neighbours), and that is the case debugging is for."""
+def find_grasp_pose(points_mm, down_cam, radius_mm=LOCAL_PCA_RADIUS_MM):
     if len(points_mm) == 0:
         return None
-    tip, anchor = wire_tip_and_anchor_cam(points_mm, T_optical_to_base)
-    if tip is None:
-        if debug:
-            show_debug_pointcloud(points_mm, debug_colors,
-                                  title=f"{debug_title} (too few points for a global PCA fit)")
-        return None
-    local_pts, wire_dir = get_local_pca_direction(tip, points_mm, radius_mm)
+    centroid = points_mm.mean(axis=0)
+    seed_pt = points_mm[np.argmin(np.linalg.norm(points_mm - centroid, axis=1))]
+    local_pts, direction = get_local_pca_direction(seed_pt, points_mm, radius_mm)
     if local_pts is None:
-        if debug:
-            show_debug_pointcloud(points_mm, debug_colors, tip=tip, anchor=anchor,
-                                  title=f"{debug_title} (local PCA failed near the tip)")
         return None
-    R = calculate_coaxial_orientation(wire_dir, up_cam)
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = local_pts.mean(axis=0)
-    if debug:
-        show_debug_pointcloud(points_mm, debug_colors, tip=tip, anchor=anchor,
-                              local_pts=local_pts, T_grasp=T, title=debug_title)
-    return T, local_pts, tip, anchor
+    centre = local_pts.mean(axis=0)
+    T = top_down_frame(centre, direction, down_cam)
+    return T, local_pts
 
 
 def _rpy_deg_to_matrix(roll_deg, pitch_deg, yaw_deg):
@@ -725,15 +494,12 @@ def _rpy_deg_to_matrix(roll_deg, pitch_deg, yaw_deg):
     ])
 
 
-def camera_up_vector(camera_extrinsic_json):
-    """World 'up' expressed in camera-optical coordinates -- the x-axis seed for
-    calculate_coaxial_orientation. Same extrinsic the top-down version used for 'down'; this is
-    just its negation, kept as its own function so the sign is named rather than inlined."""
+def camera_down_vector(camera_extrinsic_json):
     with open(camera_extrinsic_json) as f:
         extr = json.load(f)
     R_base_to_optical = _rpy_deg_to_matrix(*extr['rpy_deg'])
-    up_cam = R_base_to_optical.T @ np.array([0.0, 0.0, 1.0])
-    return up_cam / np.linalg.norm(up_cam)
+    down_cam = R_base_to_optical.T @ np.array([0.0, 0.0, -1.0])
+    return down_cam / np.linalg.norm(down_cam)
 
 
 def camera_to_base_transform(camera_extrinsic_json):
@@ -807,29 +573,28 @@ def publish_grasp_tf(T_best, camera_frame, grasp_frame, prev_proc=None):
     return proc
 
 
-def build_grasp_payload(T_grasp_base, wire_name, frame_idx, untwist_deg=0.0):
-    """Same per-grasp schema as wire_grasp_pipeline_orbbec.py's build_grasp_payload(), plus
-    "untwist_deg" -- the magnitude, in degrees, grasp_executor_untwist.py should spin the wrist
-    by (in its own fixed, hardcoded direction -- see that script) to undo the counted twist.
-    0.0 means no twist was counted (or none could be)."""
+def build_grasp_payload(T_grasp_base, wire_name, frame_idx):
+    """Same per-grasp schema as wire_grasp_pose_orbbec.py's publish_grasp() --
+    "frame": "base" tells grasp_executor.py to skip its own camera-frame
+    hand-eye transform (this pose is already in base frame, via
+    camera_to_base_transform()). Built but not sent -- see publish_grasps()."""
     jaw_clearance_m = (WIRE_WIDTH_MM + 2 * SIDE_MARGIN_MM) / 1000.0
     return {
-        "translation":  T_grasp_base[:3, 3].tolist(),
-        "rotation":     T_grasp_base[:3, :3].tolist(),
-        "score":        1.0,
-        "width":        jaw_clearance_m,
-        "frame_idx":    frame_idx,
-        "prompt":       wire_name,
-        "frame":        "base",
-        "stem":         f"live_{frame_idx:03d}",
-        "untwist_deg":  float(untwist_deg),
+        "translation": T_grasp_base[:3, 3].tolist(),
+        "rotation":    T_grasp_base[:3, :3].tolist(),
+        "score":       1.0,
+        "width":       jaw_clearance_m,
+        "frame_idx":   frame_idx,
+        "prompt":      wire_name,
+        "frame":       "base",
+        "stem":        f"live_{frame_idx:03d}",
     }
 
 
 def publish_grasps(pub_socket, payloads, frame_idx):
     """Send every wire's grasp from this capture as ONE message, {"frame_idx":
     ..., "grasps": [payload, ...]} -- not one publish_grasp() call per wire.
-    The SUB side (grasp_executor_untwist.py) runs with CONFLATE=1, which keeps only
+    The SUB side (grasp_executor.py) runs with CONFLATE=1, which keeps only
     the latest message and silently drops the rest; back-to-back sends for
     the same capture would race against however fast the executor drains the
     socket, and a colour could be dropped before it's ever read. Bundling
@@ -871,8 +636,8 @@ def main():
             intrinsics.update(fx=fx, fy=fy, cx=cx, cy=cy)
         return intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"]
 
-    up_cam = camera_up_vector(args.camera_extrinsic_json)
-    logger.info(f"World 'up' in camera-optical frame: [{up_cam[0]:+.3f}, {up_cam[1]:+.3f}, {up_cam[2]:+.3f}]")
+    down_cam = camera_down_vector(args.camera_extrinsic_json)
+    logger.info(f"Gravity 'down' in camera-optical frame: [{down_cam[0]:+.3f}, {down_cam[1]:+.3f}, {down_cam[2]:+.3f}]")
     T_optical_to_base = camera_to_base_transform(args.camera_extrinsic_json)
 
     zmq_ctx = zmq.Context()
@@ -936,9 +701,6 @@ def main():
         pick_bbox("auto" if args.auto_bbox else "manual", preview_rgb, preview_depth)
 
     processor = load_sam3(args.checkpoint, args.confidence)
-    #Reuses `processor` (the same loaded SAM3 model/weights) instead of loading a second
-    #checkpoint onto the GPU -- see SamRobotUntwisting.py's identical use of seg.processor.
-    rotation_counter = WireRotationCounter(processor=processor)
     tf_procs = {}  # wire_name -> ros2 static_transform_publisher subprocess, one persistent TF per colour
     frame_idx = 0
 
@@ -946,7 +708,7 @@ def main():
         print("\nPress Enter to run capture->segment->grasp->publish, 's' + Enter to hand-pick the "
               "crop box, 'a' + Enter to auto-detect it, 'm' + Enter to reload it, 'q' + Enter to quit.")
     else:
-        print("\nAuto mode: waiting for the ready-signal from grasp_executor_untwist.py to run "
+        print("\nAuto mode: waiting for the ready-signal from grasp_executor.py to run "
               "capture->segment->grasp->publish (Ctrl-C to quit).")
 
     while True:
@@ -955,7 +717,7 @@ def main():
             if key == "q":
                 break
         else:
-            sig_sub.recv()  # blocks until grasp_executor_untwist.py's right-arm-park signal arrives
+            sig_sub.recv()  # blocks until grasp_executor.py's home-both-arms signal arrives
             logger.info(f"[{frame_idx}] ready-signal received -- running pipeline")
             key = ""
 
@@ -982,13 +744,7 @@ def main():
 
         print(f"=== frame {frame_idx} ===")
         wires_this_frame = [w for w in wires if wire_filter is None or w[0] == wire_filter]
-        rotation_colors = [name.split('_')[0] for name, _prompt, _clr in wires_this_frame]
 
-        # Grasp geometry comes from the whole twisted BUNDLE (rotation_counter's own wire mask),
-        # not a single coloured strand -- see module docstring / bundle_points_from_rotation.
-        # Colour only decides which strand's rotation count to apply; it never picks grasp points
-        # in this, the common, path.
-        #
         # SAM3 detection is flaky frame-to-frame (auto-exposure, IR glare, momentary blur) --
         # retry with a fresh capture up to --detect_retries times before giving up on this
         # cycle. Only the successful attempt's payloads get published, so this can never
@@ -1024,74 +780,36 @@ def main():
             xyz = bbox_utils.depth_to_xyz(depth_mm, fx, fy, cx - bx, cy - by)
             valid = np.isfinite(xyz).all(axis=-1)
 
-            sam_rgb = bbox_utils.normalize_lighting(rgb, color_order='rgb') if not args.no_light_norm else rgb
-            try:
-                rotation_out = rotation_counter.analyze(sam_rgb, colors=rotation_colors)
-            except RuntimeError as exc:
-                print(f"  rotation count failed on this crop ({exc}) -- "
-                      f"falling back to per-colour segmentation for grasp geometry")
-                rotation_out = None
+            segmented = segment_frame(processor, rgb, xyz, valid, wires_this_frame,
+                                      min_confidence=args.min_confidence)
 
-            bundle = bundle_points_from_rotation(rotation_out, rgb, xyz, valid) if rotation_out is not None else None
+            if not args.no_viz:
+                for name, _prompts, _color in wires_this_frame:
+                    if name in segmented:
+                        mask, points_mm, _colors, matched_prompt = segmented[name]
+                        show_mask_overlay(viz_queue, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), mask, matched_prompt,
+                                          int(mask.sum()))
 
-            candidates = []  # [(wire_label, points_mm, rotations, colors_0to1), ...]
-            if bundle is not None:
-                mask, points_mm, colors_arr = bundle
-                if not args.no_viz:
-                    show_mask_overlay(viz_queue, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), mask,
-                                      rotation_out['results']['wire_prompt'], int(mask.sum()))
-                if wire_filter is not None:
-                    color = wire_filter.split('_')[0]  # always in strand_masks: color came from rotation_colors above
-                    strand_px = int(rotation_out['strand_masks'][color].sum())
-                    if strand_px == 0:
-                        #The bundle WAS found -- only the requested colour was not in it. Grasp it
-                        #anyway (matches SamRobotUntwisting.py's default REQUIRE_COLOR_STRAND=False):
-                        #the untwist just comes back 0 since there is no strand to count rotations on.
-                        print(f"  no '{color} wire' strand inside the bundle (found via "
-                              f"'{rotation_out['results']['wire_prompt']}') -- grasping the bundle "
-                              f"anyway, untwist will be 0 rotations")
-                    rotations = rotation_out['results']['per_strand_rotations'].get(color, 0.0)
-                    wire_label = wire_filter
-                else:
-                    rotations = rotation_out['results']['final_rotations']
-                    wire_label = rotation_out['results']['wire_prompt'].replace(' ', '_')
-                candidates.append((wire_label, points_mm, rotations, colors_arr))
-            else:
-                # No bundle mask (rotation counting failed outright, e.g. a mis-placed crop box) --
-                # the one case the per-colour SAM3 pass is still worth paying for, and its cloud is
-                # the only grasp geometry left. Same fallback as SamRobotUntwisting.py.
-                segmented = segment_frame(processor, rgb, xyz, valid, wires_this_frame,
-                                          min_confidence=args.min_confidence, light_norm=not args.no_light_norm)
-                if not args.no_viz:
-                    for name, prompt, _color in wires_this_frame:
-                        if name in segmented:
-                            seg_mask, seg_points_mm, _ = segmented[name]
-                            show_mask_overlay(viz_queue, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), seg_mask,
-                                              prompt, int(seg_mask.sum()))
-                if not segmented:
-                    print("  no wire detected in this frame")
-                    continue
-                ranked = sorted(segmented.items(), key=lambda kv: -len(kv[1][1]))
-                if len(ranked) > 1:
-                    print(f"  candidates by points: {', '.join(f'{n}={len(p):,}' for n, (_, p, _) in ranked)}")
-                candidates = [(name, points_mm, 0.0, colors_arr)
-                             for name, (_mask, points_mm, colors_arr) in ranked]
+            if not segmented:
+                print("  no wire detected in this frame")
+                continue
+
+            # One grasp per detected colour -- each wire's own top (most-points) mask goes through
+            # find_grasp_pose() and gets published independently, so "all of red/blue/yellow in the
+            # scene" publishes three grasps, not just the single best one across colours.
+            ranked = sorted(segmented.items(), key=lambda kv: -len(kv[1][1]))
+            if len(ranked) > 1:
+                print(f"  candidates by points: {', '.join(f'{n}={len(p):,}' for n, (_, p, _, _) in ranked)}")
 
             attempt_payloads = []
-            for wire_name, points_mm, rotations, colors_arr in candidates:
-                result = find_coaxial_grasp_pose(points_mm, up_cam, T_optical_to_base,
-                                                 debug=args.debug_pcd, debug_colors=colors_arr,
-                                                 debug_title=f"{wire_name} ({len(points_mm):,} pts)")
+            for wire_name, (_mask, points_mm, _colors, _matched_prompt) in ranked:
+                result = find_grasp_pose(points_mm, down_cam)
                 if result is None:
-                    print(f"  {wire_name}: not enough points near a wire end for a coaxial grasp pose, skipping")
+                    print(f"  {wire_name}: not enough points near its centre for a grasp pose, skipping")
                     continue
-                T_grasp_optical_mm, local_pts, tip, anchor = result
-                untwist_deg = round(rotations) * 180.0
-
-                print(f"  {wire_name} ({len(points_mm):,} pts) coaxial grasp (camera-optical frame, mm): "
-                      f"{np.round(T_grasp_optical_mm[:3, 3], 1).tolist()}"
-                      + (f", counted {rotations:.1f} rotations -> untwist {untwist_deg:.0f} deg"
-                         if untwist_deg else ""))
+                T_grasp_optical_mm, local_pts = result
+                print(f"  {wire_name} ({len(points_mm):,} pts) grasp (camera-optical frame, mm): "
+                      f"{np.round(T_grasp_optical_mm[:3, 3], 1).tolist()}")
 
                 if not args.no_publish_tf:
                     grasp_frame = f"{args.grasp_frame}_{wire_name}"
@@ -1103,10 +821,10 @@ def main():
                     T_grasp_optical_m[:3, 3] /= 1000.0
                     T_grasp_base = T_optical_to_base @ T_grasp_optical_m
                     print(f"  {wire_name} grasp (robot base frame, m): {np.round(T_grasp_base[:3, 3], 4).tolist()}")
-                    attempt_payloads.append(build_grasp_payload(T_grasp_base, wire_name, frame_idx, untwist_deg))
+                    attempt_payloads.append(build_grasp_payload(T_grasp_base, wire_name, frame_idx))
 
             if not attempt_payloads:
-                print("  no candidate wire had enough points near an end for a coaxial grasp pose")
+                print("  no candidate wire had enough points near its centre for a grasp pose")
                 continue
 
             payloads = attempt_payloads
