@@ -1008,6 +1008,12 @@ def run_perpendicular_cycle(cap, args, bbox, get_intrinsics, processor, down_cam
     for attempt in range(args.detect_retries + 1):
         if attempt > 0:
             print(f"  retrying with a fresh capture (attempt {attempt + 1}/{args.detect_retries + 1})…")
+        # Reconnect from scratch every attempt, not just the cycle's first one -- same
+        # rationale as run_coaxial_cycle's identical call: grab_rgb()'s freshness/stability
+        # checks alone weren't a strong enough guarantee against a wrong-depth-under-a-correct-
+        # mask result, and a retry deserves the same guarantee the first attempt gets, not a
+        # weaker one from reusing a connection that's no longer brand-new.
+        cap.reconnect()
         img_rgb, img_depth_mm = cap.grab_rgb(timeout=args.wait_timeout)
         if img_depth_mm is None:
             print("  no depth frame available yet, skipping this attempt")
@@ -1090,17 +1096,18 @@ def run_coaxial_cycle(cap, args, bbox, get_intrinsics, processor, rotation_count
     wires_this_frame = [w for w in wires if wire_filter is None or w[0] == wire_filter]
     rotation_colors = [name.split('_')[0] for name, _prompt, _clr in wires_this_frame]
 
-    # Reconnect from scratch for this stage: grab_rgb()'s freshness/stability checks operate on
-    # frames from the SAME long-lived subscriber threads, which is enough in isolation but a
-    # wrong-depth-under-a-right-looking-mask result kept recurring here specifically (never in a
-    # short-lived, freshly-connected test) even with those checks passing. Tearing down and
-    # restarting the ZMQ subscription entirely removes any possible carry-over from the
-    # connection's own history, not just from the cached frame.
-    cap.reconnect()
-
     for attempt in range(args.detect_retries + 1):
         if attempt > 0:
             print(f"  retrying with a fresh capture (attempt {attempt + 1}/{args.detect_retries + 1})…")
+        # Reconnect from scratch every attempt, not just the cycle's first one: grab_rgb()'s
+        # freshness/stability checks operate on frames from the SAME long-lived subscriber
+        # threads, which is enough in isolation but a wrong-depth-under-a-right-looking-mask
+        # result kept recurring here specifically (never in a short-lived, freshly-connected
+        # test) even with those checks passing. Tearing down and restarting the ZMQ subscription
+        # entirely removes any possible carry-over from the connection's own history, not just
+        # from the cached frame -- and a retry deserves that same guarantee, not a weaker one
+        # from reusing a connection that's no longer brand-new.
+        cap.reconnect()
         img_rgb, img_depth_mm = cap.grab_rgb(timeout=args.wait_timeout)
         if img_depth_mm is None:
             print("  no depth frame available yet, skipping this attempt")
